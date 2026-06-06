@@ -698,40 +698,110 @@ N_CANDIDATES = min(5000, max(2000, 200 * dim_q)) if not SMOKE_TEST else 4
 
 torch.manual_seed(0)
 
-while not state.restart_triggered:  # Run until TuRBO converges
-    # Fit a GP model
-    train_Y = (Y_turbo - Y_turbo.mean()) / Y_turbo.std()
-    likelihood = GaussianLikelihood(noise_constraint=Interval(1e-8, 1e-3))
-    covar_module = ScaleKernel(  # Use the same lengthscale prior as in the TuRBO paper
+GP_TRAIN_MAX_POINTS = int(os.environ.get("GP_TRAIN_MAX_POINTS", "1200"))
+GP_BAD_VALUE_CUTOFF = float(os.environ.get("GP_BAD_VALUE_CUTOFF", "-100.0"))
+
+def _deduplicate_training_data(X, Y, decimals=8):
+    x_np = np.round(X.detach().cpu().numpy(), decimals=decimals)
+    y_np = Y.squeeze(-1).detach().cpu().numpy()
+    best_index_by_x = {}
+    for idx, row in enumerate(x_np):
+        key = tuple(row.tolist())
+        if key not in best_index_by_x or y_np[idx] > y_np[best_index_by_x[key]]:
+            best_index_by_x[key] = idx
+    keep = sorted(best_index_by_x.values())
+    keep_tensor = torch.tensor(keep, dtype=torch.long, device=X.device)
+    return X[keep_tensor], Y[keep_tensor]
+
+def prepare_gp_training_data(X, Y, max_points=GP_TRAIN_MAX_POINTS):
+    y_flat = Y.squeeze(-1)
+    finite_mask = torch.isfinite(y_flat) & torch.isfinite(X).all(dim=-1)
+    good_mask = finite_mask & (y_flat > GP_BAD_VALUE_CUTOFF)
+    if good_mask.sum() >= max(16, batch_size):
+        mask = good_mask
+    else:
+        mask = finite_mask
+    X_train = X[mask]
+    Y_train = Y[mask]
+    X_train, Y_train = _deduplicate_training_data(X_train, Y_train)
+    n_train = X_train.shape[0]
+    if n_train > max_points:
+        y_train_flat = Y_train.squeeze(-1)
+        n_best = min(max(64, max_points // 4), n_train)
+        n_recent = max_points - n_best
+        best_idx = torch.topk(y_train_flat, k=n_best).indices
+        recent_idx = torch.arange(n_train - n_recent, n_train, device=X_train.device)
+        keep_idx = torch.unique(torch.cat([best_idx, recent_idx]))
+        X_train = X_train[keep_idx]
+        Y_train = Y_train[keep_idx]
+    return X_train, Y_train
+
+def build_gp_model(train_X, train_Y_raw, noise_lower=1e-6, noise_upper=1e-1):
+    y_std = train_Y_raw.std(unbiased=False).clamp_min(1e-8)
+    train_Y = (train_Y_raw - train_Y_raw.mean()) / y_std
+    train_Yvar = torch.full_like(train_Y, 0.05)
+    likelihood = GaussianLikelihood(noise_constraint=Interval(noise_lower, noise_upper))
+    covar_module = ScaleKernel(
         MaternKernel(
             nu=2.5, ard_num_dims=dim_q, lengthscale_constraint=Interval(0.005, 4.0)
         )
     )
-    train_Yvar = torch.full_like(train_Y, 0.05)
     model = SingleTaskGP(
-        X_turbo, train_Y, train_Yvar, covar_module=covar_module, likelihood=likelihood
+        train_X, train_Y, train_Yvar, covar_module=covar_module, likelihood=likelihood
     )
-
     mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    return model, mll, train_Y
 
-    # Do the fitting and acquisition function optimization inside the Cholesky context
-    with gpytorch.settings.max_cholesky_size(max_cholesky_size):
-        # Fit the model
-        fit_gpytorch_mll(mll)
+def fit_gp_model_with_retries(train_X, train_Y_raw):
+    retry_settings = [
+        (1e-6, 1e-6, 1e-1),
+        (1e-5, 1e-5, 1.0),
+        (1e-4, 1e-4, 10.0),
+    ]
+    last_error = None
+    for jitter, noise_lower, noise_upper in retry_settings:
+        model, mll, train_Y = build_gp_model(train_X, train_Y_raw, noise_lower, noise_upper)
+        try:
+            with gpytorch.settings.max_cholesky_size(max_cholesky_size), gpytorch.settings.cholesky_jitter(jitter):
+                fit_gpytorch_mll(mll)
+            return model, train_Y
+        except Exception as exc:
+            last_error = exc
+            print(
+                f"WARNING: GP fitting failed with jitter={jitter:g}, "
+                f"noise=[{noise_lower:g}, {noise_upper:g}]: {exc}"
+            )
+    raise last_error
 
-        # Create a batch
-        X_next = generate_batch(
-            state=state,
-            model=model,
-            X=X_turbo,
-            Y=train_Y,
-            batch_size=batch_size,
-            n_candidates=N_CANDIDATES,
-            num_restarts=NUM_RESTARTS,
-            raw_samples=RAW_SAMPLES,
-            acqf="qucb",
-        )
-        X_next = torch.clamp(X_next, 0.0, 1.0)
+def generate_random_tr_batch(state, X, Y, batch_size):
+    x_center = X[Y.squeeze(-1).argmax(), :].clone()
+    tr_lb = torch.clamp(x_center - state.length / 2.0, 0.0, 1.0)
+    tr_ub = torch.clamp(x_center + state.length / 2.0, 0.0, 1.0)
+    sobol = SobolEngine(X.shape[-1], scramble=True)
+    pert = sobol.draw(batch_size).to(dtype=dtype, device=device)
+    return tr_lb + (tr_ub - tr_lb) * pert
+
+while not state.restart_triggered:  # Run until TuRBO converges
+    # Fit a GP model
+    train_X, train_Y_raw = prepare_gp_training_data(X_turbo, Y_turbo)
+    try:
+        model, train_Y = fit_gp_model_with_retries(train_X, train_Y_raw)
+        with gpytorch.settings.max_cholesky_size(max_cholesky_size), gpytorch.settings.cholesky_jitter(1e-6):
+            X_next = generate_batch(
+                state=state,
+                model=model,
+                X=train_X,
+                Y=train_Y,
+                batch_size=batch_size,
+                n_candidates=N_CANDIDATES,
+                num_restarts=NUM_RESTARTS,
+                raw_samples=RAW_SAMPLES,
+                acqf="qucb",
+            )
+            X_next = torch.clamp(X_next, 0.0, 1.0)
+    except Exception as exc:
+        print(f"WARNING: all GP fitting attempts failed; using random TR batch. Error: {exc}")
+        X_next = generate_random_tr_batch(state, X_turbo, Y_turbo, batch_size)
     Y_next =  eval_objective(X_next)
 
     # Update state

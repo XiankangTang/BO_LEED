@@ -108,9 +108,9 @@ class Turbo1:
         self.n_evals = 0
 
         # Trust region sizes
-        self.length_min = 0.5 ** 7
-        self.length_max = 1.6
-        self.length_init = 0.8
+        self.length_min = 0.1 ** 5
+        self.length_max = 100
+        self.length_init = 1.6
 
         # Save the full history
         self.X = np.zeros((0, self.dim))
